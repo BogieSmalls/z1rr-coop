@@ -1,8 +1,11 @@
 import pytest
 
-from bridge_core.cc_client import CCClient
+from bridge_core.cc_client import MAX_FRAME_LENGTH, CCClient
 
 from .mock_cc_server import MockCCServer
+
+# action $03: MID, action, length, address lo, hi, the bytes, checksum
+MAX_WRITE_ARRAY_BYTES = MAX_FRAME_LENGTH - 6
 
 
 def make_client_with_mock(ram_size: int = 0x0800) -> tuple[CCClient, MockCCServer]:
@@ -83,3 +86,68 @@ def test_frame_includes_checksum_byte():
     expected_checksum = (1 + 0x00 + 1 + 0x42 + 0x00) & 0xFF
     assert frame[6] == expected_checksum
     assert len(frame) == 7
+
+
+def test_guarded_write_writes_when_the_guards_hold():
+    client, server = make_client_with_mock()
+    server.set_ram(0x067B, 3)
+    client.send_guarded_write([(0x067B, 4), (0x0657, 1)], [(0x067B, 3), (0x0657, 0)])
+    server.step()
+    assert client.poll_response(timeout_ms=100) == b"\x01"
+    assert (server.ram[0x067B], server.ram[0x0657]) == (4, 1)
+
+
+def test_guarded_write_reports_a_failed_guard():
+    client, server = make_client_with_mock()
+    server.set_ram(0x0657, 1)
+    client.send_guarded_write([(0x067B, 4)], [(0x0657, 0)])
+    server.step()
+    assert client.poll_response(timeout_ms=100) == b"\x00"
+    assert server.ram[0x067B] == 0
+
+
+def test_guarded_write_without_an_answer_is_unknown():
+    client, _server = make_client_with_mock()
+    assert client.guarded_write([(0x067B, 4)], [], timeout_ms=10) is None
+
+
+def test_guarded_write_refuses_a_frame_that_reaches_7fff():
+    client, _server = make_client_with_mock()
+    client.send_guarded_write([(0x0600 + i, 0) for i in range(3)], [(0x0700 + i, 0) for i in range(27)])
+    with pytest.raises(ValueError):
+        client.send_guarded_write([(0x0600 + i, 0) for i in range(3)], [(0x0700 + i, 0) for i in range(28)])
+
+
+def test_no_frame_longer_than_the_cart_takes_is_sent():
+    from bridge_core.cc_client import MAX_READ_ADDRS
+    client, server = make_client_with_mock()
+    client.send_write_array(0x0010, bytes(MAX_WRITE_ARRAY_BYTES))
+    with pytest.raises(ValueError):
+        client.send_write_array(0x0010, bytes(MAX_WRITE_ARRAY_BYTES + 1))
+    with pytest.raises(ValueError):
+        client.send_read_addrs(list(range(MAX_READ_ADDRS + 1)))
+
+
+def test_read_addrs_splits_into_frames_the_cart_takes():
+    from bridge_core.cc_client import MAX_READ_ADDRS
+    client, server = make_client_with_mock()
+    sent = []
+    send = client.send_read_addrs
+    client.send_read_addrs = lambda addrs: (sent.append(len(addrs)), send(addrs), server.step())
+    server.set_ram(0x0100, bytes(range(100)))
+    assert client.read_addrs(list(range(0x0100, 0x0164)), timeout_ms=50) == bytes(range(100))
+    assert sent == [MAX_READ_ADDRS, MAX_READ_ADDRS, 100 - 2 * MAX_READ_ADDRS]
+
+
+def test_reply_data_that_looks_like_a_status_pair_is_kept():
+    """Data can hold 00 A5 or 04 A5, the firmware's status pairs: the reply is found by its header
+    and its values taken as received, not with those pairs cut out."""
+    from bridge_core.cc_client import REPLY_PRELUDE
+    from .mock_serial import MockSerial
+    sp = MockSerial()
+    client = CCClient(sp)
+    client.send_read_array(0x0657, 4)
+    sp.take_tx()
+    values = bytes((0x00, 0xA5, 0x04, 0xA5))
+    sp.feed_rx(bytes((0x00, 0xA5)) + REPLY_PRELUDE + bytes((len(values) + 3, 0x00, 0x20, 1, 0x01)) + values)
+    assert client.poll_response(timeout_ms=20) == values

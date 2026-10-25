@@ -7,7 +7,8 @@ CC frame format (host -> cart, wrapped in a USB MEM_WR to ADDR_FIFO):
     L (1 byte)       = body length INCLUDING the trailing checksum byte
     MID (1 byte)     = monotonic message id, 1..255
     ACTION (1 byte)  = 0x00 read addrs, 0x01 read array, 0x02 write pairs,
-                       0x03 write array, 0x04 freeze, 0xFE version
+                       0x03 write array, 0x04 freeze, 0x05 guarded write
+                       (extend_patch.py), 0xFE version
     payload...
     CHECKSUM (1 byte) = sum(MID + ACTION + payload) mod 256
 
@@ -36,6 +37,18 @@ ADDR_FIFO = 0x01810000
 CMD_MEM_WR = 0x1A
 P = 0x2B
 
+ACTION_GUARDED_WRITE = 0x05
+ACTION_VERSION = 0xFE
+VERSION_LENGTH = 5
+PATCH_REVISION = 0x01        # the version's first byte once extend_patch.py's changes are in
+REPLY_PRELUDE = bytes((P, P ^ 0xFF, 0x22, 0x22 ^ 0xFF))     # the cart's EDIO write, before each reply
+# MID..checksum land at $7FA0-$7FFE; $7FFF is the game's SaveRamEnd marker ($A5). The cart drops a
+# frame with a longer L (extend_patch.py's drain; beta 8's copied it on past $7FFF), so none is sent.
+MAX_FRAME_LENGTH = 0x7FFF - 0x7FA0
+MAX_GUARDED_BODY = MAX_FRAME_LENGTH
+# action $00: MID, action, count, two bytes per address, checksum
+MAX_READ_ADDRS = (MAX_FRAME_LENGTH - 4) // 2
+
 
 class SerialLike(Protocol):
     def write(self, data: bytes) -> int: ...
@@ -58,8 +71,8 @@ def _make_cc_frame(mid: int, action: int, payload: bytes) -> bytes:
     checksum = sum(body) & 0xFF
     body_with_checksum = body + bytes((checksum,))
     L = len(body_with_checksum)
-    if L > 255:
-        raise ValueError(f"CC frame too large: {L}")
+    if L > MAX_FRAME_LENGTH:
+        raise ValueError(f"CC frame too large: {L} bytes (the cart takes {MAX_FRAME_LENGTH} at most)")
     return bytes((L,)) + body_with_checksum
 
 
@@ -131,10 +144,50 @@ class CCClient:
         payload = bytes((len(data) & 0xFF, base & 0xFF, (base >> 8) & 0xFF)) + data
         self._usb_mem_wr(ADDR_FIFO, _make_cc_frame(mid, 0x03, payload))
 
-    def read_addrs(self, addrs: list[int], timeout_ms: int = 500, chunk_size: int = 100) -> bytes | None:
+    def send_guarded_write(self, writes: list[tuple[int, int]], guards: list[tuple[int, int]]) -> None:
+        """Action 0x05 (extended patch, revision 1): in one game frame, make every (addr, value)
+        write only if every (addr, value) guard still holds. Guards read their address, so they
+        belong on RAM. The cart stores MID..checksum at $7FA0; a frame body over
+        MAX_GUARDED_BODY bytes would reach $7FFF, the game's save-RAM marker, so it is refused."""
+        payload = bytes((len(guards),))
+        for addr, val in guards:
+            payload += bytes((addr & 0xFF, (addr >> 8) & 0xFF, val & 0xFF))
+        payload += bytes((len(writes),))
+        for addr, val in writes:
+            payload += bytes((addr & 0xFF, (addr >> 8) & 0xFF, val & 0xFF))
+        if len(payload) + 3 > MAX_GUARDED_BODY:
+            raise ValueError(f"guarded write too large: {len(guards)} guards + {len(writes)} writes "
+                             f"(at most {(MAX_GUARDED_BODY - 5) // 3} together)")
+        mid = self._next_mid()
+        self._usb_mem_wr(ADDR_FIFO, _make_cc_frame(mid, ACTION_GUARDED_WRITE, payload))
+        self._expected_mid = mid
+        self._expected_action = ACTION_GUARDED_WRITE
+        self._expected_values = 1
+
+    def guarded_write(self, writes: list[tuple[int, int]], guards: list[tuple[int, int]],
+                      timeout_ms: int = 500) -> bool | None:
+        """True if the cart made the writes, False if a guard failed (nothing written), None on
+        a timeout (unknown: read again before retrying)."""
+        self.send_guarded_write(writes, guards)
+        answer = self.poll_response(timeout_ms=timeout_ms)
+        if answer is None or len(answer) != 1:
+            return None
+        return answer[0] == 1
+
+    def version(self, timeout_ms: int = 500) -> bytes | None:
+        """Action 0xFE's five bytes; the first is the patch revision (0 for beta 8 and before,
+        PATCH_REVISION for extend_patch.py's), or None on a timeout."""
+        mid = self._next_mid()
+        self._usb_mem_wr(ADDR_FIFO, _make_cc_frame(mid, ACTION_VERSION, b""))
+        self._expected_mid = mid
+        self._expected_action = ACTION_VERSION
+        self._expected_values = VERSION_LENGTH
+        return self.poll_response(timeout_ms=timeout_ms)
+
+    def read_addrs(self, addrs: list[int], timeout_ms: int = 500,
+                   chunk_size: int = MAX_READ_ADDRS) -> bytes | None:
         """Read N individual addresses; chunks into multiple frames if needed
-        (action 0x00 frames have a 1-byte count and a 1-byte L, so a single
-        frame fits at most ~125 addresses). Returns concatenated bytes in the
+        (a frame fits at most MAX_READ_ADDRS addresses). Returns concatenated bytes in the
         original `addrs` order, or None if any chunk times out."""
         if not addrs:
             return b""
@@ -166,13 +219,37 @@ class CCClient:
                 snapshot[base + i] = byte
         return snapshot
 
+    def _framed_reply(self) -> bytes | None:
+        """The values of the expected reply, found by its whole header (prelude, size, $00 $20, MID,
+        action) in the bytes as received, and taken as they are: data can hold the same bytes as a
+        status pair (00 A5, 04 A5), which the scan below would cut out of it."""
+        header = REPLY_PRELUDE + bytes((self._expected_values + 3, 0x00, 0x20, self._expected_mid & 0xFF))
+        at = self._rx_buf.find(header)
+        while at >= 0:
+            action_at = at + len(header)
+            if action_at >= len(self._rx_buf):
+                return None
+            if self._rx_buf[action_at] in (self._expected_action & 0xFF, 0x00):
+                end = action_at + 1 + self._expected_values
+                if end > len(self._rx_buf):
+                    return None
+                result = bytes(self._rx_buf[action_at + 1:end])
+                self._rx_buf.clear()
+                return result
+            at = self._rx_buf.find(header, at + 1)
+        return None
+
     def poll_response(self, timeout_ms: int = 100) -> bytes | None:
-        """Wait up to timeout_ms for a response matching the last send_read_*."""
+        """Wait up to timeout_ms for a response matching the last send_read_*: by its whole header
+        first, else by scanning for [0x20, MID, action] with status pairs removed."""
         deadline = time.perf_counter() + timeout_ms / 1000.0
         while time.perf_counter() < deadline:
             n = self._sp.in_waiting
             if n:
                 self._rx_buf += self._sp.read(n)
+            framed = self._framed_reply()
+            if framed is not None:
+                return framed
             filt = _strip_status_pairs(bytes(self._rx_buf))
             for i in range(len(filt) - 3):
                 if (

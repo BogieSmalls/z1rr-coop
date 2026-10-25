@@ -18,9 +18,10 @@ P = 0x2B
 class MockCCServer:
     """Simulates the cart-side of the CC protocol against a MockSerial."""
 
-    def __init__(self, ram_size: int = 0x0800) -> None:
+    def __init__(self, ram_size: int = 0x0800, patch_revision: int = 1) -> None:
         self.serial = MockSerial()
         self.ram = bytearray(ram_size)
+        self.patch_revision = patch_revision      # the version answer's first byte (beta 8: 0)
         self._tx_carryover = bytearray()  # partial frames from bridge that haven't completed yet
 
     def set_ram(self, addr: int, value: int | bytes) -> None:
@@ -117,6 +118,24 @@ class MockCCServer:
             data = body[3:3 + count]
             self.ram[base:base + len(data)] = data
             self._respond(mid, 0x03, b"\x01")
+        elif action == 0xFE:
+            # Version: five bytes, the first the patch revision (extend_patch.py)
+            self._respond(mid, 0xFE, bytes((self.patch_revision, 0x00, 0x10, 0x10, 0x08)))
+        elif action == 0x05:
+            # Guarded write: G + G (2-byte addr + val), then W + W (2-byte addr + val)
+            def triples(at: int) -> tuple[list[tuple[int, int]], int]:
+                count = body[at]
+                pairs = [(int.from_bytes(body[at + 1 + 3 * i:at + 3 + 3 * i], "little"), body[at + 3 + 3 * i])
+                         for i in range(count)]
+                return pairs, at + 1 + 3 * count
+            guards, at = triples(0)
+            writes, _ = triples(at)
+            held = all(a < len(self.ram) and self.ram[a] == v for a, v in guards)
+            if held:
+                for a, v in writes:
+                    if a < len(self.ram):
+                        self.ram[a] = v
+            self._respond(mid, 0x05, b"\x01" if held else b"\x00")
 
     def _respond(self, mid: int, action: int, values: bytes) -> None:
         """Push a CC response frame back to the bridge: 0x20, mid, action, values."""

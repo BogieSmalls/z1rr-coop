@@ -1,3 +1,13 @@
+# Unreleased: EDN8 patch revision 1
+
+- **New EDN8 patch (revision 1).** Adds a guarded-write command (for Archipelago), shrinks the freeze slots to four at $7F40-$7F7F, moves the patch's flag off $07FE (which erased room $7F's saved flags in levels 7-9), and drops the unused Crowd Control speed hook, so ROMs with Pegasus Boots or Red Bubble Curse: Slow Speed are accepted. Co-op's sync is unchanged. Details: `bridge/docs/patch-revision-1.md`.
+- **Fixes the EDN8 graphics glitch and crash during sessions.** With a partner connected (or any steady bridge traffic), swinging the sword could garble the HUD and palettes, shake the screen and then crash or reset the game. The patch read each incoming USB message after a single status check, so a message still arriving was misread and could be copied past $7FFF into the mapper's registers. The new reader checks before every byte, finishes a message in the next frame, refuses lengths over 95, reads at most 8 bytes a frame, and the hook checks each message's checksum before running it. Details: `bridge/docs/patch-revision-1.md`, "The NMI drain".
+- **Fixes EDN8 reads that timed out on some data.** The USB client cut the firmware's status pairs (00 A5, 04 A5) out of the data of an answer too, so any read whose data held those two bytes came back short and timed out, again on every try while the bytes stayed. Answers are now found by their whole header and their data taken as received.
+- **ROMs patched by beta 8** are re-patched from their original when chosen; the beta 8 bridge refuses ROMs patched by this one.
+- **Beta 8 carts paired with newer ones:** the bridge no longer syncs a beta 8 cart's own $07FE (its patch flag), and ignores that flag's $AB when a beta 8 EDN8 partner sends it; it put a stray $AB into room $7F of levels 7-9.
+- **`bridge_cli patch-check`** checks a cart's patch revision and guarded write.
+- **Send patched ROM to EDN8**: one button on the ROM setup screen patches the ROM, copies it to the cart and starts it, staying on the screen, so the game can be restarted on the cart without restarting the bridge. It replaces the "Also upload patched ROM to EDN8" checkbox: Continue now only patches and saves.
+
 # z1rr-coop v2.0 beta 8 - release notes
 
 Eighth community-testing build of the z1rr-coop bridge. Beta8 focuses on hardware-session stability and diagnostics after live EDN8 and MiSTer testing: better MiSTer setup checks, clearer live diagnostics, EDN8 `tloz_all` overload protection, newer EDN8 firmware COM detection, and bridge message parity with FCEUX.

@@ -22,6 +22,7 @@ MiSTer, EDN8 <-> MiSTer, EDN8 <-> EDN8, or MiSTer <-> MiSTer.
 2. **Run the .exe** and choose `EverDrive Pro N8` or `MiSTer`.
 3. For **EDN8**, plug in your cart and follow the patch/upload flow:
    - Pick your Z1 ROM (vanilla or Z1R seed; both work)
+   - Click `Send patched ROM to EDN8` to patch it, copy it to the cart's SD card and start it, then `Continue`
    - Auto-detect your EDN8's COM port
    - Choose a session code (any 6+ char string you and your partner agree on)
    - Connect to the relay
@@ -52,6 +53,9 @@ python -m bridge_cli patch zelda.nes -o zelda_CC.nes
 
 # Run a session
 python -m bridge_cli run --mode tloz_all --port COM3 --code mycode
+
+# Check a cart's patch (revision, guarded write) with a game in play
+python -m bridge_cli patch-check --port COM3
 
 # Deploy MiSTer helper/core payload
 python -m bridge_cli mister-deploy --host 192.168.0.130
